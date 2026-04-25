@@ -53,14 +53,12 @@ jobs:
           EC2_SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
         run: |
           if [ -z "$EC2_HOST" ] || [ -z "$EC2_SSH_KEY" ]; then
-            echo "configured=false" >> "$GITHUB_OUTPUT"
-            echo "AWS deploy secrets missing; skipping deploy."
-          else
-            echo "configured=true" >> "$GITHUB_OUTPUT"
+            echo "ERROR: EC2_HOST and EC2_SSH_KEY secrets must be set to deploy." >&2
+            exit 1
           fi
+          echo "configured=true" >> "$GITHUB_OUTPUT"
 
       - name: Deploy via SSH
-        if: steps.deploy-config.outputs.configured == 'true'
         uses: appleboy/ssh-action@v1.2.0
         with:
           host: ${{ secrets.EC2_HOST }}
