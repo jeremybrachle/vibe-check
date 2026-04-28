@@ -48,6 +48,7 @@ class DigestKind(str, Enum):
 class RunOrigin(str, Enum):
     manual = "manual"
     scheduled = "scheduled"
+    super_manual = "super_manual"
 
 
 class ResearchScope(str, Enum):
@@ -212,6 +213,44 @@ def latest_digest(
     return _snapshot_to_digest(snapshot)
 
 
+@router.get("/digest/latest-with-ai", response_model=DigestOut)
+def latest_digest_with_ai(
+    source: SourceScope | None = Query(default=None),
+    provider: str | None = Query(default=None, description="Optional provider filter: ollama, openai, heuristic"),
+    kind: DigestKind | None = Query(default=None),
+    db: Session = Depends(get_db),
+) -> DigestOut:
+    """Return the most recent snapshot that actually has an AI summary.
+
+    Used by the dashboard so that toggling AI mode on doesn't blank the
+    AI Summary panel when the most recent snapshot is a structured-only
+    refresh whose provider differs from the currently selected one.
+    """
+    q = select(Snapshot).order_by(desc(Snapshot.created_at))
+    if source:
+        q = q.where(Snapshot.source_set == source.value)
+    if kind:
+        q = q.where(Snapshot.kind == kind.value)
+    # Pull a small window and filter in Python so we can match heuristic/ollama/openai
+    # while excluding "none" / empty summaries.
+    rows = db.execute(q.limit(50)).scalars().all()
+    for row in rows:
+        snap_provider = (row.llm_provider or "").lower()
+        summary = (row.summary_text or "").strip()
+        if not summary or snap_provider in {"", "none"}:
+            continue
+        if provider:
+            wanted = provider.lower()
+            if wanted in {"openai", "cloud"} and snap_provider != "openai":
+                continue
+            if wanted == "ollama" and snap_provider != "ollama":
+                continue
+            if wanted == "heuristic" and snap_provider != "heuristic":
+                continue
+        return _snapshot_to_digest(row)
+    raise HTTPException(status_code=404, detail="No snapshot with AI summary available yet.")
+
+
 @router.get("/digest/{digest_id}", response_model=DigestOut)
 def get_digest(digest_id: int, db: Session = Depends(get_db)) -> DigestOut:
     snapshot = db.get(Snapshot, digest_id)
@@ -331,10 +370,14 @@ def latest_daily_summary(
 async def refresh_now(
     kind: DigestKind = Query(default=DigestKind.regular, description="regular | daily_summary | daily_preview"),
     source: SourceScope = Query(default=SourceScope.hackernews, description="hackernews | reddit"),
+    run_origin: RunOrigin = Query(
+        default=RunOrigin.manual,
+        description="manual = ad-hoc, super_manual = admin override (renders cron star unlit)",
+    ),
     db: Session = Depends(get_db),
 ) -> DigestOut:
     pipeline = DigestPipeline(db)
-    snapshot = await pipeline.run_cycle(kind=kind.value, run_origin="manual", source_filter=source.value)
+    snapshot = await pipeline.run_cycle(kind=kind.value, run_origin=run_origin.value, source_filter=source.value)
     return _snapshot_to_digest(snapshot)
 
 
@@ -356,8 +399,12 @@ async def admin_override_refresh(
     admin_override_started_at = datetime.utcnow()
     try:
         pipeline = DigestPipeline(db)
+        # Admin override only refreshes the regular kind. Daily preview and
+        # daily summary are intentionally decoupled — they run only at their
+        # scheduled cron times (9:01 AM ET / 5:01 PM PT) or via the dedicated
+        # admin "Run now" buttons on each daily card.
         snapshot = await pipeline.run_cycle(
-            kind="super_duper_manual_trigger",
+            kind="regular",
             run_origin="super_manual",
             source_filter=source.value,
         )
@@ -522,6 +569,85 @@ def set_provider(provider: str = Query(..., description="none | heuristic | open
         raise HTTPException(status_code=400, detail=f"Invalid provider. Choose from: {', '.join(sorted(_VALID_PROVIDERS))}")
     settings.llm_provider = provider
     return {"provider": settings.llm_provider}
+
+
+@router.get("/admin/llm/status")
+async def llm_status() -> dict:
+    """Live health probe for the configured LLM provider.
+
+    Used by the dashboard to show a green/red indicator and to disable the
+    admin refresh buttons when the provider is unreachable.
+    """
+    provider = get_llm_provider()
+    label = getattr(provider, "label", settings.llm_provider)
+
+    payload: dict = {
+        "provider": settings.llm_provider,
+        "resolved_provider": label,
+        "ok": False,
+        "reachable": False,
+        "detail": "",
+    }
+
+    # Heuristic + none never need a network call.
+    if label in {"heuristic", "none"}:
+        payload["ok"] = True
+        payload["reachable"] = True
+        payload["detail"] = (
+            "Heuristic provider is local-only — always available."
+            if label == "heuristic"
+            else "AI summaries are disabled (provider=none)."
+        )
+        return payload
+
+    if label == "ollama":
+        import httpx
+
+        base = settings.ollama_base_url.rstrip("/")
+        model = settings.ollama_model
+        payload["base_url"] = base
+        payload["model"] = model
+        try:
+            async with httpx.AsyncClient(timeout=4.0) as client:
+                tags = await client.get(f"{base}/api/tags")
+                tags.raise_for_status()
+                data = tags.json()
+                installed = [m.get("name", "") for m in (data.get("models") or [])]
+                payload["reachable"] = True
+                payload["installed_models"] = installed
+                if not model:
+                    payload["detail"] = "Ollama reachable but OLLAMA_MODEL is empty."
+                elif model not in installed and not any(m.startswith(f"{model}:") or m == model for m in installed):
+                    payload["detail"] = (
+                        f"Ollama is reachable but model '{model}' is not pulled. "
+                        f"Run: ollama pull {model}"
+                    )
+                else:
+                    payload["ok"] = True
+                    payload["detail"] = f"Ollama reachable at {base}; model '{model}' is available."
+        except Exception as exc:
+            payload["detail"] = (
+                f"Cannot reach Ollama at {base}: {exc}. "
+                "Start it with: OLLAMA_KEEP_ALIVE=30m ollama serve"
+            )
+        return payload
+
+    if label == "openai":
+        key_set = bool(settings.openai_api_key.get_secret_value())
+        payload["model"] = settings.openai_model
+        payload["api_key_present"] = key_set
+        if not key_set:
+            payload["detail"] = "OPENAI_API_KEY is not set."
+        else:
+            # We don't make a real request to avoid burning credits; mark as
+            # configured and let pipeline runs surface real errors via logs.
+            payload["ok"] = True
+            payload["reachable"] = True
+            payload["detail"] = "OpenAI key configured. Real connectivity is verified at refresh time."
+        return payload
+
+    payload["detail"] = f"Unknown provider label: {label}"
+    return payload
 
 
 @router.get("/admin/scheduler/jobs")

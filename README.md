@@ -4,6 +4,24 @@ News-aggregation digest pipeline and dashboard.
 
 Currently wired to Hacker News only (free API), with source adapter architecture for adding Reddit, GitHub Trending, Product Hunt, RSS feeds, and more.
 
+---
+
+## ⚠️ Current state (2026-04-27)
+
+**Backend is healthy. Frontend is in transition.**
+
+- The full original frontend is quarantined in `web_backup_2026-04-27/`
+  because it hangs the browser tab so hard that DevTools can't even attach
+  (suspected infinite loop or runaway sync op in `app.js`).
+- The live `web/index.html` is a placeholder "HELLO IT WORKS" page so the
+  static mount keeps working while we rebuild incrementally.
+- 19/19 backend tests pass. All `/api/v1/*` routes are unaffected.
+
+**Read [HANDOFF_2026-04-27_PART_2.md](HANDOFF_2026-04-27_PART_2.md) for the
+current rebuild plan, AWS deployment ordering, and portfolio framing.**
+
+---
+
 ## What this includes
 
 - Multi-source-ready ingestion layer (`app/services/sources/`)
@@ -22,48 +40,74 @@ Currently wired to Hacker News only (free API), with source adapter architecture
   - Daily preview at `9:01 AM` Eastern (uses prior summary + recent snapshots as context)
 - API + dashboard UI with manual `Refresh now` button
 
-## Quick start
+## How to run it
 
-1. Create and activate your Python virtual environment.
-2. Install dependencies:
+From a **WSL Ubuntu** terminal:
 
 ```bash
-pip install -r requirements.txt
+cd ~/programming/vibe-check
+source .venv/bin/activate
+python3 -m uvicorn app.main:app --host localhost --port 8000 --reload
 ```
 
-3. Create env file:
+Then open <http://localhost:8000/> in your browser. `Ctrl+C` to stop, then
+`deactivate` to leave the venv.
 
+Default mode is `heuristic` (no Ollama, no API keys, no network LLM).
+
+> **Why `--host localhost` and not `0.0.0.0`?** `localhost` is correct for
+> local dev and gives a clean log line. Use `0.0.0.0` only when deploying
+> (e.g. AWS), where the load balancer needs to reach the process from
+> outside the host.
+
+### One-time setup
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env       # optional — see "Configuration" below
+```
+
+### Configuration
+
+Settings can come from either a `.env` file or OS environment variables.
+Env vars **override** `.env`. Both are optional — `app/config.py` has sane
+defaults.
+
+**Option A — `.env` file** (status quo, easy):
 ```bash
 cp .env.example .env
+# edit values as needed; uvicorn auto-loads them
 ```
 
-4. Optional LLM setup:
-- For heuristic local summaries (no model), set `LLM_PROVIDER=heuristic`
-- For local Ollama summaries, set `LLM_PROVIDER=ollama` and `OLLAMA_MODEL=openchat` (or another pulled model)
-- For cloud LLM, set `LLM_PROVIDER=openai` and `OPENAI_API_KEY=...`
-- To fully disable summaries, set `LLM_PROVIDER=none`
-
-If using Ollama, start it in a separate terminal first:
-
+**Option B — manual `export`** (more control, no file needed):
 ```bash
-OLLAMA_NOHISTORY=1 OLLAMA_KEEP_ALIVE=30m ollama serve
+export APP_ENV=development
+export LLM_PROVIDER=heuristic
+export DATABASE_URL="sqlite:///./vibe_check.db"
+export ALLOWED_ORIGINS="http://localhost:5173"
+python -m uvicorn app.main:app --host localhost --port 8000 --reload
 ```
 
-You can verify models with:
+Mixing is fine: keep stable values in `.env`, override one with `export`
+for a single run.
 
-```bash
-ollama list
-```
+### Switching LLM mode
 
-5. Run app:
+Edit `.env` (or use `export LLM_PROVIDER=...`):
 
-```bash
-uvicorn app.main:app --reload
-```
+| Value | What it does |
+| --- | --- |
+| `heuristic` | Local keyword-based summary. **Default.** No Ollama, no keys. |
+| `none` | No `ai_summary` at all. Everything else works. |
+| `ollama` | Use a running Ollama (set `OLLAMA_BASE_URL` + `OLLAMA_MODEL`). |
+| `openai` | Use OpenAI (set `OPENAI_API_KEY`). |
+| `auto` | OpenAI if key set, else Ollama if reachable, else none. |
 
-6. Open:
-- Dashboard: `http://127.0.0.1:8000/`
-- API docs: `http://127.0.0.1:8000/docs`
+Restart the server after changing the provider.
+
+API docs are at <http://localhost:8000/docs>.
 
 ## Stop everything
 
@@ -82,29 +126,31 @@ ss -ltnp | grep -E ':(8000|11434)\b' || echo "no listeners"
 
 ## Testing
 
-Run the unit tests locally:
+Unit tests (no server needed):
 
 ```bash
-cd /home/kerry/programming/vibe-check
-.venv/bin/python -m pytest tests/ -q
+source .venv/bin/activate
+python -m pytest tests/ -q
 ```
 
-Run the live smoke tests against a running API:
+Live smoke tests against a running API:
 
 ```bash
+source .venv/bin/activate
+
 # local app
-.venv/bin/python tests/smoke_test_live_api.py
+python tests/smoke_test_live_api.py
 
 # deployed API
-API_BASE=http://your-ec2-ip:8000 .venv/bin/python tests/smoke_test_live_api.py
+API_BASE=http://your-ec2-ip:8000 python tests/smoke_test_live_api.py
 
 # validate CORS for a second frontend
 API_BASE=http://your-ec2-ip:8000 CORS_ORIGIN=https://your-other-site.com \
-  .venv/bin/python tests/smoke_test_live_api.py
+  python tests/smoke_test_live_api.py
 
 # validate protected admin queue endpoint
 API_BASE=http://your-ec2-ip:8000 ADMIN_TOKEN=your-token \
-  .venv/bin/python tests/smoke_test_live_api.py
+  python tests/smoke_test_live_api.py
 ```
 
 The smoke script checks the deployed API surface end-to-end: health, latest

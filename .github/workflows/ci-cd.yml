@@ -41,61 +41,20 @@ jobs:
 
   deploy-aws:
     name: Deploy to AWS
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     needs: unit-tests
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    permissions:
-      id-token: write
-      contents: read
 
     steps:
-      - name: Configure AWS credentials via OIDC
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
-          aws-region: ${{ vars.AWS_REGION }}
-
-      - name: Deploy via SSM
+      - name: Pull latest code
         run: |
-          COMMAND_ID=$(aws ssm send-command \
-            --instance-ids "${{ vars.EC2_INSTANCE_ID }}" \
-            --document-name "AWS-RunShellScript" \
-            --parameters 'commands=[
-              "set -e",
-              "cd /home/ubuntu/vibe-check",
-              "git pull origin main",
-              ".venv/bin/pip install -r requirements.txt --quiet",
-              "sudo systemctl restart vibe-check"
-            ]' \
-            --query "Command.CommandId" \
-            --output text)
+          cd /home/ubuntu/vibe-check
+          git pull origin main
 
-          echo "SSM Command ID: $COMMAND_ID"
+      - name: Install dependencies
+        run: |
+          cd /home/ubuntu/vibe-check
+          .venv/bin/pip install -r requirements.txt --quiet
 
-          aws ssm wait command-executed \
-            --command-id "$COMMAND_ID" \
-            --instance-id "${{ vars.EC2_INSTANCE_ID }}"
-
-          STATUS=$(aws ssm get-command-invocation \
-            --command-id "$COMMAND_ID" \
-            --instance-id "${{ vars.EC2_INSTANCE_ID }}" \
-            --query "StatusDetails" \
-            --output text)
-
-          OUTPUT=$(aws ssm get-command-invocation \
-            --command-id "$COMMAND_ID" \
-            --instance-id "${{ vars.EC2_INSTANCE_ID }}" \
-            --query "StandardOutputContent" \
-            --output text)
-
-          echo "$OUTPUT"
-
-          if [ "$STATUS" != "Success" ]; then
-            echo "Deploy failed with status: $STATUS" >&2
-            aws ssm get-command-invocation \
-              --command-id "$COMMAND_ID" \
-              --instance-id "${{ vars.EC2_INSTANCE_ID }}" \
-              --query "StandardErrorContent" \
-              --output text >&2
-            exit 1
-          fi
+      - name: Restart app
+        run: sudo systemctl restart vibe-check

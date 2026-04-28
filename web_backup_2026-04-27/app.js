@@ -17,6 +17,9 @@ let clockTimer = null;
 let schedulerWatchTimer = null;
 let scheduledRunWatch = null;
 let schedulerOverviewTimer = null;
+let latestSnapshotPollTimer = null;
+let lastSeenLatestSnapshotId = 0;
+let latestHeaderDigest = null;
 let llmVibeLoadToken = 0;
 const llmVibeCache = {};
 
@@ -27,6 +30,8 @@ const SCHED_PANEL_VISIBLE_KEY = "vibe-check-scheduler-panel-visible";
 const DOTS_HIDDEN_KEY = "vibe-check-dots-hidden";
 const AI_AUTO_KEY = "vibe-check-ai-auto-mode";
 const APP_VERSION = "v1.0.0";
+const runtimeConfig = window.VIBE_CONFIG || {};
+const API_BASE = String(runtimeConfig.API_BASE || "").trim().replace(/\/+$/, "");
 const CHANGELOG_ENTRIES = [
   {
     version: "v1.0.0",
@@ -51,11 +56,15 @@ function updateVersionMeta(digest = null) {
   if (!el) {
     return;
   }
+  if (currentProvider === "none") {
+    el.textContent = `${APP_VERSION} • AI mode off`;
+    return;
+  }
   if (!digest) {
     el.textContent = `${APP_VERSION} • snapshot unavailable • waiting for first scheduled run`;
     return;
   }
-  const refreshed = formatInSelectedTimezone(digest.created_at, { withZone: true });
+  const refreshed = formatInSelectedTimezone(digest.created_at, { withDate: true, withZone: true });
   const versionTag = `${digest.kind || "regular"} #${digest.id || "-"}`;
   el.textContent = `${APP_VERSION} • snapshot ${versionTag} • last refreshed ${refreshed}`;
 }
@@ -117,6 +126,32 @@ function setQueueRefreshLabel(text) {
   const value = String(text || "").trim();
   el.hidden = !value;
   el.textContent = value;
+  syncRefreshStatusPanelVisibility();
+}
+
+// Hides the settings "refresh status" bubble entirely whenever none of its
+// children (statusLine / queueRefreshLabel / runProgressWrap) are visible.
+function syncRefreshStatusPanelVisibility() {
+  const panels = document.querySelectorAll(".refresh-status-panel");
+  for (const panel of panels) {
+    const anyVisible = Array.from(panel.children).some(
+      (c) => !c.hidden && c.style.display !== "none",
+    );
+    panel.hidden = !anyVisible;
+  }
+}
+
+function observeRefreshStatusPanels() {
+  const panels = document.querySelectorAll(".refresh-status-panel");
+  const observer = new MutationObserver(() => syncRefreshStatusPanelVisibility());
+  for (const panel of panels) {
+    observer.observe(panel, {
+      attributes: true,
+      attributeFilter: ["hidden", "style"],
+      subtree: true,
+    });
+  }
+  syncRefreshStatusPanelVisibility();
 }
 
 function clearQueueProgress() {
@@ -314,8 +349,22 @@ function toggleTheme() {
 }
 
 
+function apiUrl(path) {
+  if (typeof path !== "string" || !path) {
+    return path;
+  }
+  if (/^https?:\/\//i.test(path) || !API_BASE) {
+    return path;
+  }
+  if (path.startsWith("/")) {
+    return `${API_BASE}${path}`;
+  }
+  return `${API_BASE}/${path}`;
+}
+
+
 async function fetchJson(url, options = {}) {
-  const response = await fetch(url, options);
+  const response = await fetch(apiUrl(url), options);
   if (!response.ok) {
     const text = await response.text();
     const err = new Error(`${response.status}: ${text}`);
@@ -510,7 +559,7 @@ function renderSnapshotArchive(element, items) {
 
     const when = document.createElement("div");
     when.className = "snapshot-when";
-    when.textContent = `${formatInSelectedTimezone(item.created_at, { withZone: true })} • ${item.item_count} items`;
+    when.textContent = `${formatInSelectedTimezone(item.created_at, { withDate: true, withZone: true })} • ${item.item_count} items`;
 
     li.title = `Open full snapshot #${item.id}`;
     li.addEventListener("click", () => {
@@ -537,7 +586,7 @@ function formatSnapshotDetailText(payload) {
   const data = payload?.data || {};
   const lines = [];
   lines.push(`Snapshot #${payload.id} (${payload.kind})`);
-  lines.push(`Created: ${formatInSelectedTimezone(payload.created_at, { withZone: true })}`);
+  lines.push(`Created: ${formatInSelectedTimezone(payload.created_at, { withDate: true, withZone: true })}`);
   lines.push(`Provider: ${payload.llm_provider || "none"}`);
   lines.push(`Origin: ${payload.run_origin || "manual"}`);
   lines.push(`Sources: ${(payload.sources || []).join(", ") || "none"}`);
@@ -595,10 +644,44 @@ async function openSnapshotDetailsModal(snapshotId) {
 
   try {
     const payload = await fetchJson(`/api/v1/digest/${snapshotId}/full`);
-    meta.textContent = `Snapshot #${payload.id} • ${payload.kind} • ${formatInSelectedTimezone(payload.created_at, { withZone: true })}`;
+    meta.textContent = `Snapshot #${payload.id} • ${payload.kind} • ${formatInSelectedTimezone(payload.created_at, { withDate: true, withZone: true })}`;
     body.textContent = formatSnapshotDetailText(payload);
   } catch (error) {
     meta.textContent = `Failed to load snapshot #${snapshotId}`;
+    body.textContent = `Error: ${error.message}`;
+  }
+}
+
+async function openLatestSnapshotForKind(kind) {
+  // Map scheduler job kinds to API digest kinds and surface the most recent
+  // matching snapshot in the modal. For "regular" upcoming jobs and admin
+  // override entries we just show whatever the latest snapshot is.
+  const modal = byId("snapshotModal");
+  const meta = byId("snapshotModalMeta");
+  const body = byId("snapshotModalBody");
+  if (!modal || !meta || !body) {
+    return;
+  }
+
+  modal.hidden = false;
+  meta.textContent = "Looking up most recent snapshot for this job...";
+  body.textContent = "Loading...";
+
+  let kindFilter = "";
+  if (kind === "daily_preview" || kind === "daily_summary") {
+    kindFilter = `&kind=${encodeURIComponent(kind)}`;
+  }
+
+  try {
+    const items = await fetchJson(`/api/v1/digest?limit=1&${sourceQueryParam()}${kindFilter}`);
+    if (!items || !items.length) {
+      meta.textContent = `No snapshots yet for ${kind}.`;
+      body.textContent = "This job has not produced a snapshot yet.";
+      return;
+    }
+    await openSnapshotDetailsModal(items[0].id);
+  } catch (error) {
+    meta.textContent = `Failed to look up snapshot for ${kind}.`;
     body.textContent = `Error: ${error.message}`;
   }
 }
@@ -607,7 +690,7 @@ function renderEndpointLinks(element, lines) {
   element.innerHTML = "";
   for (const line of lines) {
     const row = document.createElement("a");
-    row.href = line.url;
+    row.href = apiUrl(line.url);
     row.textContent = line.label;
     row.target = "_blank";
     row.rel = "noreferrer noopener";
@@ -662,9 +745,9 @@ function formatInSelectedTimezone(value, options = {}) {
   }
   return new Intl.DateTimeFormat("en-US", {
     timeZone: getSelectedTimezone(),
-    year: options.dateOnly ? "numeric" : undefined,
-    month: options.dateOnly ? "2-digit" : undefined,
-    day: options.dateOnly ? "2-digit" : undefined,
+    year: options.dateOnly || options.withDate ? "numeric" : undefined,
+    month: options.dateOnly ? "2-digit" : (options.withDate ? "short" : undefined),
+    day: options.dateOnly || options.withDate ? "2-digit" : undefined,
     hour: options.dateOnly ? undefined : "2-digit",
     minute: options.dateOnly ? undefined : "2-digit",
     second: options.withSeconds ? "2-digit" : undefined,
@@ -686,7 +769,7 @@ function formatSnapshotMeta(digest, prefix = "Updated") {
     return "No data yet.";
   }
 
-  const parts = [`${prefix} ${formatInSelectedTimezone(digest.created_at)}`];
+  const parts = [`${prefix} ${formatInSelectedTimezone(digest.created_at, { withDate: true })}`];
   const countLabel = formatStoryCount(digest.item_count);
   if (countLabel) {
     parts.push(countLabel);
@@ -1355,15 +1438,6 @@ async function loadDailySections() {
   let previewDigest = preview.latest;
   let summaryDigest = summary.latest;
 
-  if (!shouldShowPlaceholder(selectedProvider)) {
-    if (previewDigest && !providerMatchesSelection(selectedProvider, previewDigest.llm_provider)) {
-      previewDigest = await findLatestDigestForProvider(selectedProvider, "daily_preview") || previewDigest;
-    }
-    if (summaryDigest && !providerMatchesSelection(selectedProvider, summaryDigest.llm_provider)) {
-      summaryDigest = await findLatestDigestForProvider(selectedProvider, "daily_summary") || summaryDigest;
-    }
-  }
-
   if (previewDigest) {
     byId("previewMeta").textContent = formatSnapshotMeta(previewDigest, "Last run");
     const previewResolved = resolveSummaryForProvider(previewDigest, selectedProvider, "Run now");
@@ -1391,6 +1465,80 @@ async function loadDailySections() {
   }
 }
 
+async function renderSignalSnapshot(digest, history = null) {
+  if (Number.isFinite(Number(digest?.id))) {
+    lastSeenLatestSnapshotId = Number(digest.id);
+  }
+  updateVersionMeta(latestHeaderDigest || digest);
+  clearLoadingState();
+
+  const summaryEl = byId("aiSummary");
+  const badgeEl = byId("aiSummaryBadge");
+  const selectedProvider = currentProvider;
+  let mainResolved = resolveSummaryForProvider(digest, selectedProvider, "Refresh now");
+  let aiSourceDigest = digest;
+
+  // When AI mode is ON but the latest snapshot doesn't carry a matching
+  // AI summary (e.g. its provider differs or it's a structured-only run),
+  // pull the AI text from the most recent snapshot that does. The rest of
+  // the dashboard still reflects the latest snapshot — we only swap the
+  // AI Summary panel content so the data feels consistent.
+  if (selectedProvider !== "none" && mainResolved.isPlaceholder) {
+    try {
+      const providerParam = selectedProvider ? `&provider=${encodeURIComponent(selectedProvider)}` : "";
+      const aiDigest = await fetchJson(`/api/v1/digest/latest-with-ai?${sourceQueryParam()}${providerParam}`);
+      if (aiDigest && aiDigest.id !== digest.id) {
+        const altResolved = resolveSummaryForProvider(aiDigest, selectedProvider, "Refresh now");
+        if (!altResolved.isPlaceholder) {
+          mainResolved = altResolved;
+          aiSourceDigest = aiDigest;
+        }
+      }
+    } catch (e) {
+      // 404 means there is no snapshot with AI yet — fall back to the placeholder.
+    }
+  }
+
+  if (selectedProvider === "none") {
+    badgeEl.textContent = "";
+    badgeEl.style.display = "none";
+  } else {
+    badgeEl.style.display = "";
+    const aiIsFromOlder = aiSourceDigest && aiSourceDigest.id !== digest.id;
+    if (aiIsFromOlder) {
+      const stamp = formatInSelectedTimezone(aiSourceDigest.created_at, { withDate: true, withZone: false }) || "earlier";
+      badgeEl.textContent = `AI from snapshot #${aiSourceDigest.id} (${stamp}) • structured data from latest #${digest.id}`;
+    } else {
+      badgeEl.textContent = `#${digest.id || "-"} • ${digest.llm_provider || "ai-on"}`;
+    }
+  }
+  summaryEl.textContent = mainResolved.text;
+  summaryEl.className = mainResolved.isPlaceholder ? "summary-empty" : "";
+  byId("exciteScore").textContent = String(digest.excitement_score ?? "-");
+  byId("skepticScore").textContent = String(digest.skepticism_score ?? "-");
+  await updateMetricNotes(digest.excitement_score ?? 0, digest.skepticism_score ?? 0);
+  wireScorePillEvents();
+
+  currentDigest = digest;
+  renderTopicList(byId("themes"), digest.today_themes);
+  renderToolList(byId("tools"), digest.most_mentioned_tools);
+  renderLinks(byId("excited"), digest.excited_about);
+  renderLinks(byId("skeptical"), digest.skeptical_about);
+
+  if (history) {
+    renderSnapshotArchive(byId("snapshots"), history);
+  }
+
+  renderTopStories(byId("topStories"), digest.top_links, digest.best_rabbit_holes);
+  const topStoriesBtn = byId("toggleTopStoriesBtn");
+  if (topStoriesBtn) {
+    topStoriesBtn.disabled = !digest.top_links || digest.top_links.length <= 3;
+    topStoriesBtn.textContent = topStoriesExpanded ? "Show less" : "Show more";
+  }
+
+  byId("architectureNote").textContent = digest.note || "";
+}
+
 async function loadLatest() {
   if (!signalDashboardActive()) {
     return;
@@ -1406,8 +1554,10 @@ async function loadLatest() {
   let digest;
   try {
     digest = await fetchJson(`/api/v1/digest/latest?${sourceQueryParam()}`);
+    latestHeaderDigest = digest;
   } catch (err) {
     if (err.status === 404) {
+      latestHeaderDigest = null;
       setLoadingState("No snapshot yet. Waiting for the next scheduled run.");
       byId("aiSummary").textContent = "";
       byId("aiSummaryBadge").textContent = "";
@@ -1418,44 +1568,7 @@ async function loadLatest() {
   }
 
   const history = await fetchJson(`/api/v1/digest?limit=10&${sourceQueryParam()}`);
-  if (!shouldShowPlaceholder(currentProvider) && !providerMatchesSelection(currentProvider, digest.llm_provider)) {
-    const persisted = await findLatestDigestForProvider(currentProvider, "regular");
-    if (persisted) {
-      digest = persisted;
-    }
-  }
-
-  updateVersionMeta(digest);
-
-  clearLoadingState();
-
-  const summaryEl = byId("aiSummary");
-  const badgeEl = byId("aiSummaryBadge");
-  const selectedProvider = currentProvider;
-  const mainResolved = resolveSummaryForProvider(digest, selectedProvider, "Refresh now");
-  badgeEl.textContent = selectedProvider === "none" ? "off" : (digest.llm_provider || "ai-on");
-  summaryEl.textContent = mainResolved.text;
-  summaryEl.className = mainResolved.isPlaceholder ? "summary-empty" : "";
-  byId("exciteScore").textContent = String(digest.excitement_score ?? "-");
-  byId("skepticScore").textContent = String(digest.skepticism_score ?? "-");
-  await updateMetricNotes(digest.excitement_score ?? 0, digest.skepticism_score ?? 0);
-  wireScorePillEvents();
-
-  currentDigest = digest;
-  renderTopicList(byId("themes"), digest.today_themes);
-  renderToolList(byId("tools"), digest.most_mentioned_tools);
-  renderLinks(byId("excited"), digest.excited_about);
-  renderLinks(byId("skeptical"), digest.skeptical_about);
-  renderSnapshotArchive(byId("snapshots"), history);
-
-  renderTopStories(byId("topStories"), digest.top_links, digest.best_rabbit_holes);
-  const topStoriesBtn = byId("toggleTopStoriesBtn");
-  if (topStoriesBtn) {
-    topStoriesBtn.disabled = !digest.top_links || digest.top_links.length <= 3;
-    topStoriesBtn.textContent = topStoriesExpanded ? "Show less" : "Show more";
-  }
-
-  byId("architectureNote").textContent = digest.note || "";
+  await renderSignalSnapshot(digest, history);
 
   await loadDailySections();
   await initSnapshotNav();
@@ -1576,12 +1689,21 @@ async function initSnapshotNav() {
 
 function updateSnapNavUI() {
   const nav = byId("snapshotNav");
-  if (!allSnapshotIds.length) {
+  if (!nav) {
+    return;
+  }
+  if (currentProvider === "none" || !allSnapshotIds.length) {
     nav.style.display = "none";
     return;
   }
   nav.style.display = "";
-  byId("snapCounter").textContent = `${currentSnapIdx + 1} / ${allSnapshotIds.length}`;
+  const current = allSnapshotIds[currentSnapIdx];
+  const dateLabel = current
+    ? formatInSelectedTimezone(current.created_at, { withDate: true, withZone: false })
+    : "";
+  byId("snapCounter").textContent = dateLabel
+    ? `${currentSnapIdx + 1} / ${allSnapshotIds.length} • ${dateLabel}`
+    : `${currentSnapIdx + 1} / ${allSnapshotIds.length}`;
   byId("snapPrevBtn").disabled = currentSnapIdx >= allSnapshotIds.length - 1;
   byId("snapNextBtn").disabled = currentSnapIdx <= 0;
 }
@@ -1593,14 +1715,7 @@ async function navigateSnapshot(delta) {
   const snap = allSnapshotIds[currentSnapIdx];
   try {
     const digest = await fetchJson(`/api/v1/digest/${snap.id}`);
-    const summaryEl = byId("aiSummary");
-    const badgeEl = byId("aiSummaryBadge");
-    const label = `${digest.llm_provider} • ${formatInSelectedTimezone(digest.created_at, { dateOnly: true })} • ${digest.kind}`;
-
-    const resolved = resolveSummaryForProvider(digest, currentProvider, "Refresh now");
-    summaryEl.textContent = resolved.text;
-    summaryEl.className = resolved.isPlaceholder ? "summary-empty" : "";
-    badgeEl.textContent = label;
+    await renderSignalSnapshot(digest);
   } catch (e) {
     byId("aiSummary").textContent = `Failed to load: ${e.message}`;
   }
@@ -1611,8 +1726,10 @@ async function refreshSnapshotHistoryAndVersion() {
   let digest;
   try {
     digest = await fetchJson(`/api/v1/digest/latest?${sourceQueryParam()}`);
+    latestHeaderDigest = digest;
   } catch (err) {
     if (err.status === 404) {
+      latestHeaderDigest = null;
       updateVersionMeta(null);
       renderSnapshotArchive(byId("snapshots"), []);
       return;
@@ -1627,6 +1744,7 @@ async function refreshSnapshotHistoryAndVersion() {
 
 async function runDailyKind(kind, metaId, summaryId, btnId) {
   const btn = byId(btnId);
+  const originalLabel = btn.textContent || (kind === "daily_preview" ? "Admin run preview" : "Admin run summary");
   btn.disabled = true;
   btn.textContent = "Running...";
   startRunProgress(
@@ -1635,14 +1753,26 @@ async function runDailyKind(kind, metaId, summaryId, btnId) {
     55000,
   );
   try {
-    const result = await fetchJson(`/api/v1/admin/refresh?kind=${kind}&${sourceQueryParam()}`, { method: "POST" });
+    // Daily admin runs are explicitly flagged super_manual so the gold cron
+    // star renders unlit on the widget. They are decoupled from the regular
+    // 2-hour cadence and from the main admin override button.
+    const result = await fetchJson(
+      `/api/v1/admin/refresh?kind=${kind}&run_origin=super_manual&${sourceQueryParam()}`,
+      { method: "POST" },
+    );
     const summaryEl = byId(summaryId);
-    const adHocAt = formatInSelectedTimezone(new Date());
+    const adHocAt = formatInSelectedTimezone(new Date(), { withDate: true });
     const nextScheduled = kind === "daily_preview"
-      ? formatInSelectedTimezone(nextScheduledTime(9, 1, "America/New_York"))
-      : formatInSelectedTimezone(nextScheduledTime(17, 1, "America/Los_Angeles"));
+      ? formatInSelectedTimezone(nextScheduledTime(9, 1, "America/New_York"), { withDate: true })
+      : formatInSelectedTimezone(nextScheduledTime(17, 1, "America/Los_Angeles"), { withDate: true });
     const modeLabel = kind === "daily_preview" ? "9:01 AM ET preview" : "5:01 PM PT summary";
-    const note = `This is just an ad-hoc generated response at ${adHocAt}. Next scheduled response is at ${nextScheduled} (${modeLabel}).`;
+    const note = `Admin override run at ${adHocAt}. Next scheduled response is at ${nextScheduled} (${modeLabel}).`;
+    byId(metaId).textContent = formatSnapshotMeta(result, "Last run");
+    if (kind === "daily_preview") {
+      setOutsideCronBadge("previewCronBadge", result.run_origin === "scheduled");
+    } else {
+      setOutsideCronBadge("summaryCronBadge", result.run_origin === "scheduled");
+    }
 
     const resolved = resolveSummaryForProvider(result, currentProvider, "Run now");
     if (kind === "daily_preview") {
@@ -1657,7 +1787,7 @@ async function runDailyKind(kind, metaId, summaryId, btnId) {
     failRunProgress(`Run failed: ${e.message}`);
   } finally {
     btn.disabled = false;
-    btn.textContent = "Run now";
+    btn.textContent = originalLabel;
   }
 }
 
@@ -1685,7 +1815,7 @@ async function renderDailyHistory(kind, div, btn) {
     meta.className = "history-grid history-grid-row history-entry-meta";
 
     const created = document.createElement("span");
-    created.textContent = formatInSelectedTimezone(item.created_at);
+    created.textContent = formatInSelectedTimezone(item.created_at, { withDate: true });
     const count = document.createElement("span");
     count.textContent = `${item.item_count}`;
     const provider = document.createElement("span");
@@ -1762,8 +1892,10 @@ function setActiveDashboard(page) {
   const signalActive = page === "hn" || page === "reddit";
   if (page === "hn") {
     activeSignalSource = "hackernews";
+    latestHeaderDigest = null;
   } else if (page === "reddit") {
     activeSignalSource = "reddit";
+    latestHeaderDigest = null;
   }
 
   const hnPage = byId("hnPage");
@@ -1915,7 +2047,7 @@ async function loadLlmVibeCheck(forceRefresh = false) {
   if (cached && !forceRefresh) {
     summaryEl.textContent = cached.summary;
     summaryEl.className = "ai-scroll-box";
-    badgeEl.textContent = `${cached.provider} • updating`;
+    badgeEl.textContent = `${cached.provider} • ${cached.stamp || "cached"} • updating`;
     boxEl?.classList.add("background-loading");
   } else {
     summaryEl.textContent = "Loading AI vibe check...";
@@ -1930,13 +2062,19 @@ async function loadLlmVibeCheck(forceRefresh = false) {
       return;
     }
     const summary = normalizeDisplayText(vibe.ai_summary || "No vibe check was generated.");
+    const stamp = vibe.generated_at
+      ? formatInSelectedTimezone(vibe.generated_at, { withDate: true })
+      : "";
     llmVibeCache[scope] = {
       summary,
       provider: vibe.llm_provider || "none",
+      stamp,
     };
     summaryEl.textContent = summary;
     summaryEl.className = "ai-scroll-box";
-    badgeEl.textContent = vibe.llm_provider || "none";
+    badgeEl.textContent = stamp
+      ? `${vibe.llm_provider || "none"} • ${stamp}`
+      : (vibe.llm_provider || "none");
     boxEl?.classList.remove("background-loading");
   } catch (error) {
     if (token !== llmVibeLoadToken) {
@@ -1945,7 +2083,7 @@ async function loadLlmVibeCheck(forceRefresh = false) {
     if (cached) {
       summaryEl.textContent = cached.summary;
       summaryEl.className = "ai-scroll-box";
-      badgeEl.textContent = `${cached.provider} • stale`;
+      badgeEl.textContent = `${cached.provider} • ${cached.stamp || ""} • stale`;
       boxEl?.classList.remove("background-loading");
       return;
     }
@@ -2112,8 +2250,10 @@ function applyAiVisibility() {
   const isHeuristic = currentProvider === "none";
   const aiPanel = byId("aiSummaryPanel");
   const dailyPanel = byId("dailyAiSection");
+  const snapshotBadge = byId("aiSummaryBadge");
   if (aiPanel) aiPanel.hidden = isHeuristic;
   if (dailyPanel) dailyPanel.hidden = isHeuristic;
+  if (snapshotBadge) snapshotBadge.style.display = isHeuristic ? "none" : "";
 
   // Scheduler is only meaningful when AI is active on the HN dashboard.
   applySchedulerOverviewVisibility();
@@ -2123,14 +2263,29 @@ function applyAiVisibility() {
   if (vibeBox) vibeBox.hidden = isHeuristic;
 
   setHeaderRefreshVisible(false);
+  updateVersionMeta(latestHeaderDigest || currentDigest);
+  updateSnapNavUI();
 }
 
 function configureAdminOverrideControls() {
   const btn = byId("adminOverrideRefreshBtn");
-  if (!btn) {
-    return;
+  const previewBtn = byId("runPreviewBtn");
+  const summaryBtn = byId("runSummaryBtn");
+  const localOnly = isLocalRuntimeHost();
+  if (btn) btn.hidden = !localOnly;
+  // The 9:01/5:01 daily admin refresh buttons are also local-admin only and
+  // are intentionally separate from the main admin override so the user can
+  // regenerate just the daily widgets without touching the regular cadence.
+  if (previewBtn) {
+    previewBtn.hidden = !localOnly;
+    previewBtn.textContent = "Admin run preview";
+    previewBtn.title = "Local admin only. Runs the 9:01 AM ET preview pipeline now. Snapshot is flagged as admin override (cron star unlit).";
   }
-  btn.hidden = !isLocalRuntimeHost();
+  if (summaryBtn) {
+    summaryBtn.hidden = !localOnly;
+    summaryBtn.textContent = "Admin run summary";
+    summaryBtn.title = "Local admin only. Runs the 5:01 PM PT summary pipeline now. Snapshot is flagged as admin override (cron star unlit).";
+  }
 }
 
 async function runAdminOverrideRefresh() {
@@ -2218,12 +2373,38 @@ function applyProviderPlaceholder(provider) {
   }
 }
 
+async function syncLatestHeaderSnapshot() {
+  try {
+    const digest = await fetchJson(`/api/v1/digest/latest?${sourceQueryParam()}`);
+    latestHeaderDigest = digest;
+    updateVersionMeta(digest);
+  } catch (e) {
+    if (e.status === 404) {
+      latestHeaderDigest = null;
+      updateVersionMeta(null);
+      return;
+    }
+    throw e;
+  }
+}
+
 async function switchProvider(provider) {
   try {
     await fetchJson(`/api/v1/admin/provider?provider=${provider}`, { method: "POST" });
     highlightProviderBtn(provider);
     applyProviderPlaceholder(provider);
-    await loadLatest();
+    // Reset cached digest state so the next render always reflects the
+    // latest snapshot rather than whatever was navigated to / cached
+    // before the toggle.
+    currentDigest = null;
+    latestHeaderDigest = null;
+    if (signalDashboardActive()) {
+      await loadLatest();
+    } else {
+      await syncLatestHeaderSnapshot();
+    }
+    // Provider changed — refresh the connection indicator immediately.
+    pollLlmStatus().catch(() => {});
   } catch (e) {
     setLoadingState(`Failed to set provider: ${e.message}`);
   }
@@ -2390,14 +2571,20 @@ function renderSchedulerOverview(overview) {
     recentEl.innerHTML = "";
     for (const item of recent) {
       const li = document.createElement("li");
-      li.className = "scheduler-node recent";
+      li.className = "scheduler-node recent scheduler-node-clickable";
+      li.title = `Open snapshot #${item.id}`;
       li.innerHTML = `
         <div class="scheduler-chip-row">
           <span class="scheduler-chip recent">recent</span>
           <span class="scheduler-kind">#${item.id} • ${item.kind}</span>
         </div>
-        <div class="scheduler-time">${formatInSelectedTimezone(item.created_at, { withZone: true })}</div>
+        <div class="scheduler-time">${formatInSelectedTimezone(item.created_at, { withDate: true, withZone: true })}</div>
       `;
+      li.addEventListener("click", () => {
+        openSnapshotDetailsModal(item.id).catch((error) => {
+          setLoadingState(`Failed to load snapshot details: ${error.message}`);
+        });
+      });
       recentEl.appendChild(li);
     }
   }
@@ -2413,14 +2600,23 @@ function renderSchedulerOverview(overview) {
       const kindLabel = item.kind === "admin_override_running" ? "admin override (running)" : item.kind;
       const chipLabel = item.kind === "admin_override_running" ? "running" : "upcoming";
       const li = document.createElement("li");
-      li.className = "scheduler-node upcoming";
+      li.className = "scheduler-node upcoming scheduler-node-clickable";
+      const isRunning = item.kind === "admin_override_running";
+      li.title = isRunning
+        ? "An admin override refresh is currently running."
+        : `Scheduled to run at ${formatInSelectedTimezone(item.next_run_time, { withDate: true, withZone: true })}. Click to view the most recent snapshot of this kind.`;
       li.innerHTML = `
         <div class="scheduler-chip-row">
           <span class="scheduler-chip upcoming">${chipLabel}</span>
           <span class="scheduler-kind">${kindLabel}</span>
         </div>
-        <div class="scheduler-time">${formatInSelectedTimezone(item.next_run_time, { withZone: true })}</div>
+        <div class="scheduler-time">${formatInSelectedTimezone(item.next_run_time, { withDate: true, withZone: true })}</div>
       `;
+      li.addEventListener("click", () => {
+        openLatestSnapshotForKind(item.kind).catch((error) => {
+          setLoadingState(`Failed to open snapshot: ${error.message}`);
+        });
+      });
       upcomingEl.appendChild(li);
     }
   }
@@ -2524,6 +2720,119 @@ function startSchedulerWatcher() {
   schedulerWatchTimer = setInterval(() => {
     pollScheduledRunState().catch(() => {});
   }, 10000);
+}
+
+async function pollForLatestSnapshotChange() {
+  if (!signalDashboardActive() || pageMode === "api") {
+    return;
+  }
+  try {
+    const latest = await fetchJson(`/api/v1/digest/latest?${sourceQueryParam()}`);
+    const latestId = Number(latest?.id || 0);
+    if (latestId > 0 && latestId !== lastSeenLatestSnapshotId) {
+      await loadLatest();
+    }
+  } catch {
+    // Best-effort polling; ignore transient fetch errors.
+  }
+}
+
+function startLatestSnapshotPolling() {
+  if (latestSnapshotPollTimer) {
+    clearInterval(latestSnapshotPollTimer);
+  }
+  pollForLatestSnapshotChange().catch(() => {});
+  latestSnapshotPollTimer = setInterval(() => {
+    pollForLatestSnapshotChange().catch(() => {});
+  }, 30000);
+}
+
+let llmStatusPollTimer = null;
+let lastLlmStatus = null;
+
+async function pollLlmStatus() {
+  const pill = byId("llmStatusPill");
+  const detail = byId("llmStatusDetail");
+  if (!pill) return;
+  try {
+    const res = await fetch(`${API_BASE}/admin/llm/status`, { cache: "no-store" });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    lastLlmStatus = data;
+
+    pill.classList.remove("llm-status-ok", "llm-status-warn", "llm-status-err", "llm-status-unknown");
+    const label = data.resolved_provider || data.provider || "unknown";
+    if (data.ok) {
+      pill.classList.add("llm-status-ok");
+      pill.textContent = `${label}: connected`;
+    } else if (data.reachable) {
+      pill.classList.add("llm-status-warn");
+      pill.textContent = `${label}: needs setup`;
+    } else if (label === "none") {
+      pill.classList.add("llm-status-unknown");
+      pill.textContent = "AI off";
+    } else {
+      pill.classList.add("llm-status-err");
+      pill.textContent = `${label}: offline`;
+    }
+
+    if (detail) {
+      detail.classList.remove("error", "success");
+      const needsNetwork = label !== "none" && label !== "heuristic";
+      if (needsNetwork && !data.ok) {
+        detail.textContent = `⚠ ${data.detail || `${label} is not reachable`} — AI refreshes are disabled until the connection is restored.`;
+        detail.classList.add("error");
+        detail.hidden = false;
+      } else if (needsNetwork && data.ok) {
+        detail.textContent = `✓ ${data.detail || `${label} is connected`}`;
+        detail.classList.add("success");
+        detail.hidden = false;
+      } else {
+        detail.textContent = "";
+        detail.hidden = true;
+      }
+    }
+
+    applyLlmStatusToControls(data);
+  } catch (err) {
+    pill.classList.remove("llm-status-ok", "llm-status-warn", "llm-status-err");
+    pill.classList.add("llm-status-unknown");
+    pill.textContent = "status unavailable";
+    if (detail) {
+      detail.hidden = true;
+    }
+  }
+}
+
+function applyLlmStatusToControls(status) {
+  const ids = ["adminOverrideRefreshBtn", "runPreviewBtn", "runSummaryBtn", "refreshBtn"];
+  // Block refresh runs only when the configured provider needs the network
+  // and isn't reachable. Heuristic and "none" stay enabled.
+  const needsNetwork = status && status.resolved_provider && status.resolved_provider !== "none" && status.resolved_provider !== "heuristic";
+  const block = !!(needsNetwork && !status.ok);
+  for (const id of ids) {
+    const btn = byId(id);
+    if (!btn) continue;
+    if (block) {
+      btn.disabled = true;
+      btn.dataset.llmBlocked = "1";
+      btn.title = status.detail || `${status.resolved_provider} is not reachable`;
+    } else if (btn.dataset.llmBlocked === "1") {
+      btn.disabled = false;
+      delete btn.dataset.llmBlocked;
+      btn.title = "";
+    }
+  }
+}
+
+function startLlmStatusPolling() {
+  if (llmStatusPollTimer) {
+    clearInterval(llmStatusPollTimer);
+  }
+  pollLlmStatus().catch(() => {});
+  llmStatusPollTimer = setInterval(() => {
+    pollLlmStatus().catch(() => {});
+  }, 15000);
 }
 
 function pickClockTimezone() {
@@ -2662,9 +2971,12 @@ document.addEventListener("keydown", (event) => {
 });
 for (const btn of document.querySelectorAll("[data-provider]")) {
   btn.addEventListener("click", () => {
+    // Clicking a provider in Settings is an explicit override. If AI auto
+    // mode was active, turn it off so the user's selection actually sticks.
     if (isAiAutoEnabled()) {
-      setLoadingState("AI auto mode is enabled. Turn it off in the header to select a provider manually.");
-      return;
+      localStorage.setItem(AI_AUTO_KEY, "0");
+      updateAiAutoButtonVisualState();
+      setProviderButtonsDisabled(false);
     }
     switchProvider(btn.dataset.provider);
   });
@@ -2674,5 +2986,8 @@ startCountdowns();
 initClockWidget();
 startSchedulerWatcher();
 startSchedulerOverviewPolling();
+startLatestSnapshotPolling();
+startLlmStatusPolling();
+observeRefreshStatusPanels();
 setResearchTab("local");
 setActiveDashboard("hn");

@@ -27,7 +27,7 @@ class Settings(BaseSettings):
     openai_model: str = "gpt-4o-mini"
 
     ollama_base_url: str = "http://localhost:11434"
-    ollama_model: str = "llama3.1:8b"
+    ollama_model: str = "openchat"
 
     # CORS: comma-separated list of allowed origins, or * for dev
     allowed_origins: str = "*"
@@ -35,7 +35,12 @@ class Settings(BaseSettings):
     # Optional token to protect /admin/refresh — leave empty to disable the check
     admin_token: SecretStr = SecretStr("")
 
-    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", case_sensitive=False)
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        case_sensitive=False,
+        extra="ignore",
+    )
 
 
 settings = Settings()

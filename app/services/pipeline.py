@@ -1,4 +1,5 @@
 import json
+import logging
 import re
 from datetime import datetime
 from pathlib import Path
@@ -12,6 +13,9 @@ from app.services.analysis import build_digest
 from app.services.llm.factory import get_llm_provider
 from app.services.sources.base import Story
 from app.services.sources.registry import get_enabled_sources
+
+
+logger = logging.getLogger(__name__)
 
 
 ARCHITECTURE_NOTE = (
@@ -133,11 +137,27 @@ class DigestPipeline:
     ) -> tuple[str, str]:
         prompt = self._build_prompt(digest=digest, context=context, kind=kind)
 
+        provider_label = getattr(provider, "label", "unknown")
         try:
             text = await provider.generate_text(prompt)
+            if not (text or "").strip():
+                logger.warning(
+                    "LLM provider %r returned empty text for kind=%s; snapshot will have no AI summary.",
+                    provider_label,
+                    kind,
+                )
+                return "", "none"
             return text, provider.label
-        except Exception:
-            # Never fail the pipeline because of LLM setup. Return empty summary.
+        except Exception as exc:
+            # Never fail the pipeline because of LLM setup. Log loudly so the
+            # operator can see why ai_summary is blank instead of silently
+            # writing "none" snapshots.
+            logger.exception(
+                "LLM provider %r failed during %s pipeline run: %s",
+                provider_label,
+                kind,
+                exc,
+            )
             return "", "none"
 
     async def _rewrite_story_article_summaries(self, digest: dict[str, Any], provider: Any) -> None:

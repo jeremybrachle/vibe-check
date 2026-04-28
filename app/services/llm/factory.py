@@ -18,9 +18,11 @@ def get_llm_provider() -> LLMProvider:
     if provider == "ollama":
         return OllamaProvider()
 
-    # auto mode: prefer OpenAI when key exists, otherwise try local Ollama, then no summary.
+    # auto mode: prefer OpenAI when key exists, otherwise try local Ollama,
+    # then fall back to the heuristic provider so AI mode always produces some
+    # summary text instead of silently writing "none" snapshots.
     if settings.openai_api_key.get_secret_value():
         return OpenAIProvider()
     if settings.ollama_base_url and settings.ollama_model:
         return OllamaProvider()
-    return NoneProvider()
+    return HeuristicProvider()

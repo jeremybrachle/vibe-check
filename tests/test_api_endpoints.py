@@ -291,7 +291,7 @@ def test_queue_refresh_auto_trigger_message(tmp_path, monkeypatch):
             "status": "auto_triggered",
             "message": "Congratulations, you're impatient. Super duper manual trigger activated.",
             "snapshot_id": 999,
-            "kind": "super_duper_manual_trigger",
+            "kind": "regular",
             "created_at": _now().isoformat(),
         }
 
@@ -579,4 +579,101 @@ def test_scheduler_super_duper_triggers_on_tenth_click(monkeypatch):
     result = asyncio.run(sched.queue_manual_refresh_trigger())
     assert result["status"] == "auto_triggered"
     assert result["kind"] == "super_duper_manual_trigger"
+
+
+def test_latest_with_ai_returns_most_recent_summary(tmp_path, monkeypatch):
+    """latest-with-ai should skip snapshots without an AI summary."""
+    client, _ = _make_client(tmp_path, monkeypatch)
+
+    # Seed a brand-new structured-only snapshot (provider=none, empty summary).
+    # /digest/latest should return this one, but /digest/latest-with-ai should
+    # skip it and fall back to the previously seeded "regular summary" row.
+    from app.database import Base  # noqa: F401  (reuse DB engine via fixture state)
+    from sqlalchemy.orm import sessionmaker
+    # Re-derive the session bound to the same SQLite file the fixture wrote to.
+    db_file = tmp_path / "test_api.db"
+    from sqlalchemy import create_engine
+    engine = create_engine(f"sqlite:///{db_file}", connect_args={"check_same_thread": False})
+    SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+    with SessionLocal() as db:
+        _seed_snapshot(
+            db,
+            kind="regular",
+            llm_provider="none",
+            summary_text="",
+            run_origin="scheduled",
+            created_at=_now(),
+        )
+
+    latest = client.get("/api/v1/digest/latest")
+    assert latest.status_code == 200
+    assert latest.json()["llm_provider"] == "none"
+    assert latest.json()["ai_summary"] == ""
+
+    latest_ai = client.get("/api/v1/digest/latest-with-ai")
+    assert latest_ai.status_code == 200
+    assert latest_ai.json()["llm_provider"] == "ollama"
+    assert latest_ai.json()["ai_summary"]
+
+
+def test_latest_with_ai_404_when_no_ai_snapshots(tmp_path, monkeypatch):
+    client, _ = _make_client(tmp_path, monkeypatch)
+
+    # Wipe the existing seeded snapshots so nothing has an AI summary.
+    db_file = tmp_path / "test_api.db"
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+    engine = create_engine(f"sqlite:///{db_file}", connect_args={"check_same_thread": False})
+    SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+    with SessionLocal() as db:
+        for snap in db.query(Snapshot).all():
+            db.delete(snap)
+        db.commit()
+        _seed_snapshot(
+            db,
+            kind="regular",
+            llm_provider="none",
+            summary_text="",
+            run_origin="scheduled",
+            created_at=_now(),
+        )
+
+    resp = client.get("/api/v1/digest/latest-with-ai")
+    assert resp.status_code == 404
+
+
+def test_admin_override_generates_only_regular(tmp_path, monkeypatch):
+    """The admin override is decoupled from the daily kinds — it should
+    produce only a `regular` snapshot flagged super_manual. Daily preview
+    and daily summary stay on their dedicated cron / admin-button paths."""
+    client, _ = _make_client(tmp_path, monkeypatch)
+
+    resp = client.post("/api/v1/admin/refresh/override?source=hackernews")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["kind"] == "regular"
+    assert body["run_origin"] == "super_manual"
+
+    # Daily widgets should still reflect the originally seeded scheduled rows,
+    # not new super_manual ones.
+    preview = client.get("/api/v1/digest/daily-preview/latest").json()["latest"]
+    summary = client.get("/api/v1/digest/daily-summary/latest").json()["latest"]
+    assert preview["run_origin"] == "scheduled"
+    assert summary["run_origin"] == "scheduled"
+
+
+def test_admin_refresh_accepts_super_manual_run_origin(tmp_path, monkeypatch):
+    """The /admin/refresh endpoint should accept run_origin=super_manual so
+    the dedicated 9:01/5:01 admin buttons can flag their snapshots correctly."""
+    client, _ = _make_client(tmp_path, monkeypatch)
+
+    resp = client.post("/api/v1/admin/refresh?kind=daily_preview&run_origin=super_manual")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["kind"] == "daily_preview"
+    assert body["run_origin"] == "super_manual"
+
+    resp = client.post("/api/v1/admin/refresh?kind=daily_summary&run_origin=super_manual")
+    assert resp.status_code == 200
+    assert resp.json()["run_origin"] == "super_manual"
 

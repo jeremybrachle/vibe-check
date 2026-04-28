@@ -177,7 +177,7 @@ async def queue_manual_refresh_trigger() -> dict:
         db: Session = SessionLocal()
         try:
             pipeline = DigestPipeline(db)
-            snapshot = await pipeline.run_cycle(kind="super_duper_manual_trigger", run_origin="super_manual")
+            snapshot = await pipeline.run_cycle(kind="regular", run_origin="super_manual")
             return {
                 "status": "auto_triggered",
                 "message": "Congratulations, you're impatient. Super duper manual trigger activated.",
@@ -282,6 +282,17 @@ def register_jobs() -> None:
         misfire_grace_time=1800,
     )
 
+    # Backup run 30 minutes later: catches missed 5:01 PM PT execution
+    # but skips if the primary run already created a recent snapshot.
+    scheduler.add_job(
+        _run_daily_with_backstop,
+        trigger=CronTrigger(hour=17, minute=31, timezone="America/Los_Angeles"),
+        kwargs={"kind": "daily_summary"},
+        id="daily_summary_pacific_backup",
+        replace_existing=True,
+        misfire_grace_time=7200,
+    )
+
     scheduler.add_job(
         _run_daily_with_backstop,
         trigger=CronTrigger(hour=9, minute=1, timezone="America/New_York"),
@@ -289,4 +300,15 @@ def register_jobs() -> None:
         id="daily_preview_eastern",
         replace_existing=True,
         misfire_grace_time=1800,
+    )
+
+    # Backup run 30 minutes later: catches missed 9:01 AM ET execution
+    # but skips if the primary run already created a recent snapshot.
+    scheduler.add_job(
+        _run_daily_with_backstop,
+        trigger=CronTrigger(hour=9, minute=31, timezone="America/New_York"),
+        kwargs={"kind": "daily_preview"},
+        id="daily_preview_eastern_backup",
+        replace_existing=True,
+        misfire_grace_time=7200,
     )
