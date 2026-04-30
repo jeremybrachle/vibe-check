@@ -1,0 +1,39 @@
+# Research-feed topic registry. Each topic maps to one or more
+# source-specific selectors. Adding a new topic = edit this file. No
+# code changes required.
+#
+# Selectors:
+#   arxiv:    list of arXiv categories (e.g. cs.CC, math.AP)
+#   reddit:   list of subreddit names (no /r/ prefix)
+#   hn:       list of HN search query strings (Algolia)
+
+topics:
+  navier_stokes:
+    arxiv: [math.AP]
+    reddit: [math, Physics]
+    hn: ["navier stokes"]
+
+  p_vs_np:
+    arxiv: [cs.CC]
+    reddit: [compsci, MachineLearning]
+    hn: ["P vs NP", "complexity theory"]
+
+  riemann:
+    arxiv: [math.NT]
+    reddit: [math]
+    hn: ["riemann hypothesis"]
+
+  bsd:
+    arxiv: [math.NT, math.AG]
+    reddit: [math]
+    hn: ["birch swinnerton-dyer", "elliptic curve"]
+
+  hodge:
+    arxiv: [math.AG]
+    reddit: [math]
+    hn: ["hodge conjecture"]
+
+  yang_mills:
+    arxiv: [math-ph, hep-th]
+    reddit: [Physics]
+    hn: ["yang mills", "mass gap"]
