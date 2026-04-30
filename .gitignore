@@ -21,3 +21,8 @@ FRONTEND_API_HANDOFF.md
 PORTFOLIO_API_OVERVIEW.md
 AWS_DEPLOY_STATUS.md
 *.pem
+
+# Markdown — ignore everything except README.md (at any depth)
+*.md
+!README.md
+!**/README.md
