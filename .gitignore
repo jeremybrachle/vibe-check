@@ -11,18 +11,13 @@ vibe_check.db
 # Accumulated runtime data — not secrets but shouldn't live in the repo
 data/*.jsonl
 
-# Internal planning / AI handoff docs — not for public repo
-AI_SUMMARY_HANDOFF.md
-AWS_GITHUB_HANDOFF.md
-handoff-llama.md
-REDDIT_HANDOFF_NEXT_STEPS.md
-DEPLOY_HANDOFF.md
-FRONTEND_API_HANDOFF.md
-PORTFOLIO_API_OVERVIEW.md
-AWS_DEPLOY_STATUS.md
+# Certs / keys
 *.pem
 
-# Markdown — ignore everything except README.md (at any depth)
+# Internal planning / AI handoff docs — ignore every .md except READMEs
+# (at any depth). Drop a new HANDOFF_*.md, AWS_*.md, etc. anywhere and
+# it'll be auto-hidden from git.
 *.md
 !README.md
+!CHANGELOG.md
 !**/README.md
