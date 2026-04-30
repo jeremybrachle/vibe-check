@@ -11,6 +11,9 @@ vibe_check.db
 # Accumulated runtime data — not secrets but shouldn't live in the repo
 data/*.jsonl
 
+# Archived / backup directories — kept locally, not pushed
+web_backup_*/
+
 # Certs / keys
 *.pem
 
