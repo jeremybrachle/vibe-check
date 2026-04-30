@@ -2,11 +2,11 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
 
 from app.api import router
 from app.config import settings
 from app.database import Base, engine
+from app.feeds_api import router as feeds_router
 from app.scheduler import register_jobs, scheduler
 
 
@@ -32,4 +32,4 @@ app.add_middleware(
 )
 
 app.include_router(router)
-app.mount("/", StaticFiles(directory="web", html=True), name="web")
+app.include_router(feeds_router)

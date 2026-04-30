@@ -1,5 +1,10 @@
+from pathlib import Path
+
 from pydantic import SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+_REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
 class Settings(BaseSettings):
@@ -34,6 +39,18 @@ class Settings(BaseSettings):
 
     # Optional token to protect /admin/refresh — leave empty to disable the check
     admin_token: SecretStr = SecretStr("")
+
+    # --- Research feeds (/api/v1/feeds/*) ------------------------------------
+    feeds_enable_arxiv: bool = True
+    feeds_enable_reddit: bool = True
+    feeds_enable_hn: bool = True
+    feeds_arxiv_min_delay_s: float = 3.1
+    feeds_request_timeout_s: float = 8.0
+    feeds_default_lookback_hours: int = 24
+    feeds_max_items_per_response: int = 200
+    feeds_user_agent: str = "vibe-check-feeds/0.1 (research; contact via repo)"
+    feeds_topics_file: Path = _REPO_ROOT / "app" / "services" / "feeds" / "topics.yaml"
+    feeds_cache_dir: Path = _REPO_ROOT / "data" / "feeds_cache"
 
     model_config = SettingsConfigDict(
         env_file=".env",
